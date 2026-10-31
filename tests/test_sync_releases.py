@@ -1,5 +1,6 @@
 import hashlib
 import io
+import os
 import tempfile
 import unittest
 import zipfile
@@ -204,7 +205,8 @@ class PayloadTests(unittest.TestCase):
 
         for tag, sha in [("v1.2.3", "d" * 64), ("v9.8.7", "e" * 64)]:
             with self.subTest(tag=tag):
-                payload = build_release_payload(release(tag), sha)
+                with patch.dict(os.environ, {"GITHUB_REPOSITORY": "PentiumB/xray-binary"}):
+                    payload = build_release_payload(release(tag), sha)
                 block = re.search(r"```json\n(.*?)\n```", payload["body"], re.S)
                 self.assertIsNotNone(block)
                 assert block is not None
