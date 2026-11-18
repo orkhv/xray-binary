@@ -11,12 +11,21 @@ from scripts.sync_releases import (
     ASSET_NAME,
     BINARY_NAME,
     DIGEST_NAME,
+    FORK,
+    FORK_ASSET_NAME,
+    FORK_SUMS_NAME,
+    OFFICIAL,
     GitHubClient,
     build_release_payload,
+    destination_tag,
     extract_xray,
+    owns_tag,
     parse_sha256,
+    parse_sha256sums,
     plan_releases,
     release_needs_sync,
+    source_start,
+    verify_fork_binary,
     version_from_tag,
 )
 
@@ -291,6 +300,136 @@ class ReconciliationTests(unittest.TestCase):
         destination = self.destination(upstream)
         destination["draft"] = True
         self.assertTrue(release_needs_sync(upstream, destination))
+
+
+def fork_release(
+    tag,
+    *,
+    published_at="2026-11-14T19:58:06Z",
+    binary_id=301,
+    sums_id=302,
+    with_assets=True,
+):
+    assets = []
+    if with_assets:
+        assets = [
+            {
+                "id": sums_id,
+                "name": FORK_SUMS_NAME,
+                "size": 166,
+                "digest": "sha256:" + "1" * 64,
+                "browser_download_url": f"https://example.test/{tag}/sums",
+            },
+            {
+                "id": binary_id,
+                "name": FORK_ASSET_NAME,
+                "size": 100,
+                "digest": "sha256:" + "2" * 64,
+                "browser_download_url": f"https://example.test/{tag}/amd64",
+            },
+            {
+                "id": 303,
+                "name": "xray-linux-arm64",
+                "size": 90,
+                "digest": "sha256:" + "3" * 64,
+                "browser_download_url": f"https://example.test/{tag}/arm64",
+            },
+        ]
+    return {
+        "tag_name": tag,
+        "name": tag,
+        "html_url": f"https://github.com/Medium1992/Xray-core-fork/releases/tag/{tag}",
+        "published_at": published_at,
+        "prerelease": False,
+        "draft": False,
+        "assets": assets,
+    }
+
+
+class ForkSourceTests(unittest.TestCase):
+    START = "2026-11-14T19:58:06Z"
+
+    def test_fork_tags_are_prefixed_and_owned_apart_from_official(self):
+        self.assertEqual(destination_tag("v26.11.9-h2Flow-6", FORK), "fork-v26.11.9-h2Flow-6")
+        self.assertEqual(destination_tag("v26.11.9", OFFICIAL), "v26.11.9")
+        self.assertTrue(owns_tag(FORK, "fork-v26.11.9-h2Flow-6"))
+        self.assertFalse(owns_tag(OFFICIAL, "fork-v26.11.9-h2Flow-6"))
+        self.assertTrue(owns_tag(OFFICIAL, "v26.11.9"))
+        self.assertFalse(owns_tag(FORK, "v26.11.9"))
+
+    def test_plans_missing_fork_releases_inside_range_only(self):
+        upstream = [
+            fork_release("v26.11.10-h2Flow", published_at="2026-11-20T00:00:00Z"),
+            fork_release("v26.11.9-h2Flow-6", published_at=self.START),
+            fork_release("v26.11.9-h2Flow-5", published_at="2026-11-14T12:01:35Z"),
+            fork_release("v26.11.9-h2Flow-7", with_assets=False, published_at="2026-11-21T00:00:00Z"),
+        ]
+        plan = plan_releases(upstream, {"fork-v26.11.9-h2Flow-6"}, self.START, FORK)
+        self.assertEqual([item["tag_name"] for item in plan], ["v26.11.10-h2Flow"])
+
+    def test_state_without_fork_section_disables_fork(self):
+        self.assertIsNone(source_start({"start_published_at": "x"}, FORK))
+        self.assertEqual(source_start({"start_published_at": "x"}, OFFICIAL), "x")
+        self.assertEqual(
+            source_start({"start_published_at": "x", "fork": {"start_published_at": "y"}}, FORK),
+            "y",
+        )
+
+    def test_parses_sha256sums_for_exact_file_name(self):
+        sums = f"{'a' * 64}  xray-linux-amd64\n{'b' * 64}  xray-linux-arm64\n"
+        self.assertEqual(parse_sha256sums(sums, "xray-linux-amd64"), "a" * 64)
+        self.assertEqual(parse_sha256sums(sums, "xray-linux-arm64"), "b" * 64)
+        with self.assertRaises(ValueError):
+            parse_sha256sums(sums, "xray-linux-386")
+        with self.assertRaises(ValueError):
+            parse_sha256sums(sums + f"{'c' * 64}  xray-linux-amd64\n", "xray-linux-amd64")
+
+    def test_verifies_fork_binary_digest_and_elf_header(self):
+        binary = b"\x7fELF" + b"\0" * 60
+        sha = hashlib.sha256(binary).hexdigest()
+        self.assertEqual(verify_fork_binary(binary, sha.upper()), sha)
+        with self.assertRaises(ValueError):
+            verify_fork_binary(binary, "0" * 64)
+        not_elf = b"#!/bin/sh\n"
+        with self.assertRaises(ValueError):
+            verify_fork_binary(not_elf, hashlib.sha256(not_elf).hexdigest())
+
+    def test_fork_payload_points_to_prefixed_tag_and_is_not_latest(self):
+        import json
+        import re
+
+        with patch.dict(os.environ, {"GITHUB_REPOSITORY": "orkhv/xray-binary"}):
+            payload = build_release_payload(fork_release("v26.11.9-h2Flow-6"), "f" * 64, FORK)
+        self.assertEqual(payload["tag_name"], "fork-v26.11.9-h2Flow-6")
+        self.assertEqual(payload["name"], "Fork Medium1992: v26.11.9-h2Flow-6")
+        self.assertEqual(payload["make_latest"], "false")
+        self.assertIn('"binary_asset_id":301', payload["body"])
+        self.assertIn('"sums_asset_id":302', payload["body"])
+        block = re.search(r"```json\n(.*?)\n```", payload["body"], re.S)
+        assert block is not None
+        self.assertEqual(
+            json.loads(block.group(1))["geodata"]["core"]["url"],
+            "https://github.com/orkhv/xray-binary/releases/download/fork-v26.11.9-h2Flow-6/Xray-linux-64",
+        )
+
+    def test_official_payload_keeps_latest_default(self):
+        payload = build_release_payload(release("v26.10.10"), "c" * 64)
+        self.assertNotIn("make_latest", payload)
+
+    def test_exact_fork_release_does_not_need_sync_and_replacement_does(self):
+        upstream = fork_release("v26.11.9-h2Flow-6")
+        payload = build_release_payload(upstream, "c" * 64, FORK)
+        destination = {
+            "tag_name": payload["tag_name"],
+            "name": payload["name"],
+            "draft": False,
+            "prerelease": False,
+            "body": payload["body"],
+            "assets": [{"name": BINARY_NAME, "digest": "sha256:" + "c" * 64}],
+        }
+        self.assertFalse(release_needs_sync(upstream, destination, FORK))
+        replaced = fork_release("v26.11.9-h2Flow-6", binary_id=401)
+        self.assertTrue(release_needs_sync(replaced, destination, FORK))
 
 
 if __name__ == "__main__":
