@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Mirror official Xray Linux x86_64 binaries into this repository's releases."""
+"""Mirror Xray Linux x86_64 binaries into this repository's releases.
+
+Two sources are mirrored:
+
+* the official XTLS/Xray-core releases (binary extracted from Xray-linux-64.zip);
+* the Medium1992/Xray-core-fork releases (raw xray-linux-amd64 binary), published
+  under tags with the ``fork-`` prefix so they never collide with official tags.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +29,10 @@ UPSTREAM_REPOSITORY = "XTLS/Xray-core"
 ASSET_NAME = "Xray-linux-64.zip"
 BINARY_NAME = "Xray-linux-64"
 DIGEST_NAME = f"{ASSET_NAME}.dgst"
+FORK_REPOSITORY = "Medium1992/Xray-core-fork"
+FORK_ASSET_NAME = "xray-linux-amd64"
+FORK_SUMS_NAME = "sha256sums.txt"
+FORK_TAG_PREFIX = "fork-"
 API_ROOT = "https://api.github.com"
 VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]*$")
 BINARY_SHA_RE = re.compile(r"SHA-256 бинарника: `([0-9a-fA-F]{64})`")
@@ -28,6 +40,44 @@ PROVENANCE_RE = re.compile(r"<!-- xray-mirror-provenance:(\{.*?\}) -->")
 MAX_ARCHIVE_SIZE = 128 * 1024 * 1024
 MAX_DIGEST_SIZE = 64 * 1024
 MAX_BINARY_SIZE = 128 * 1024 * 1024
+ELF_MAGIC = b"\x7fELF"
+
+
+@dataclass(frozen=True)
+class Source:
+    key: str
+    repository: str
+    tag_prefix: str
+    binary_asset: str
+    digest_asset: str
+    # Names of the provenance fields for the two assets. The official source
+    # keeps its historical names so existing releases are not re-synced.
+    provenance_names: tuple[str, str]
+    name_prefix: str
+    make_latest: bool
+
+
+OFFICIAL = Source(
+    key="official",
+    repository=UPSTREAM_REPOSITORY,
+    tag_prefix="",
+    binary_asset=ASSET_NAME,
+    digest_asset=DIGEST_NAME,
+    provenance_names=("zip", "digest"),
+    name_prefix="",
+    make_latest=True,
+)
+FORK = Source(
+    key="fork",
+    repository=FORK_REPOSITORY,
+    tag_prefix=FORK_TAG_PREFIX,
+    binary_asset=FORK_ASSET_NAME,
+    digest_asset=FORK_SUMS_NAME,
+    provenance_names=("binary", "sums"),
+    name_prefix="Fork Medium1992: ",
+    make_latest=False,
+)
+SOURCES = (OFFICIAL, FORK)
 
 
 def version_from_tag(tag: str) -> str:
@@ -37,15 +87,47 @@ def version_from_tag(tag: str) -> str:
     return version
 
 
+def destination_tag(upstream_tag: str, source: Source = OFFICIAL) -> str:
+    version_from_tag(upstream_tag)
+    return f"{source.tag_prefix}{upstream_tag}"
+
+
+def owns_tag(source: Source, tag: str) -> bool:
+    """Whether a destination release tag belongs to this source."""
+    if source.tag_prefix:
+        return tag.startswith(source.tag_prefix)
+    return not any(
+        other.tag_prefix and tag.startswith(other.tag_prefix) for other in SOURCES
+    )
+
+
 def asset_by_name(release: dict[str, Any], name: str) -> dict[str, Any] | None:
     return next((asset for asset in release.get("assets", []) if asset.get("name") == name), None)
 
 
-def is_mirrorable(release: dict[str, Any]) -> bool:
+def is_mirrorable(release: dict[str, Any], source: Source = OFFICIAL) -> bool:
     return (
         not release.get("draft", False)
-        and asset_by_name(release, ASSET_NAME) is not None
-        and asset_by_name(release, DIGEST_NAME) is not None
+        and asset_by_name(release, source.binary_asset) is not None
+        and asset_by_name(release, source.digest_asset) is not None
+    )
+
+
+def in_scope(
+    upstream_releases: list[dict[str, Any]],
+    start_published_at: str,
+    source: Source = OFFICIAL,
+) -> list[dict[str, Any]]:
+    """Mirrorable releases inside the configured range, newest first."""
+    return sorted(
+        (
+            release
+            for release in upstream_releases
+            if is_mirrorable(release, source)
+            and (release.get("published_at") or "") >= start_published_at
+        ),
+        key=lambda release: release["published_at"],
+        reverse=True,
     )
 
 
@@ -53,24 +135,18 @@ def plan_releases(
     upstream_releases: list[dict[str, Any]],
     destination_tags: set[str],
     start_published_at: str,
+    source: Source = OFFICIAL,
 ) -> list[dict[str, Any]]:
-    candidates = sorted(
-        (
-            release
-            for release in upstream_releases
-            if is_mirrorable(release)
-            and (release.get("published_at") or "") >= start_published_at
-        ),
-        key=lambda release: release["published_at"],
-        reverse=True,
-    )
+    candidates = in_scope(upstream_releases, start_published_at, source)
     if not candidates:
         return []
 
     # The durable timestamp boundary is the source of truth. Restore every
     # missing in-range release, including when the destination is completely empty.
     missing = [
-        release for release in candidates if release["tag_name"] not in destination_tags
+        release
+        for release in candidates
+        if destination_tag(release["tag_name"], source) not in destination_tags
     ]
     return list(reversed(missing))
 
@@ -80,6 +156,20 @@ def parse_sha256(digest_text: str) -> str:
     if not match:
         raise ValueError("official digest does not contain SHA2-256")
     return match.group(1).lower()
+
+
+def parse_sha256sums(sums_text: str, filename: str) -> str:
+    """Read the SHA-256 of ``filename`` from a ``sha256sum`` style file."""
+    found = [
+        match.group(1).lower()
+        for match in re.finditer(
+            r"^([0-9a-fA-F]{64})[ \t]+\*?(\S+)[ \t]*$", sums_text, re.MULTILINE
+        )
+        if match.group(2) == filename
+    ]
+    if len(found) != 1:
+        raise ValueError(f"checksum file must list {filename} exactly once")
+    return found[0]
 
 
 def extract_xray(zip_bytes: bytes, expected_sha256: str, version: str, output_dir: Path) -> Path:
@@ -107,25 +197,48 @@ def extract_xray(zip_bytes: bytes, expected_sha256: str, version: str, output_di
     return output_path
 
 
-def upstream_provenance(release: dict[str, Any]) -> dict[str, Any]:
-    zip_asset = asset_by_name(release, ASSET_NAME)
-    digest_asset = asset_by_name(release, DIGEST_NAME)
-    if zip_asset is None or digest_asset is None:
-        raise ValueError(f"release {release.get('tag_name')} lacks required official assets")
-    return {
-        "zip_asset_id": zip_asset.get("id"),
-        "zip_asset_digest": zip_asset.get("digest"),
-        "zip_asset_size": zip_asset.get("size"),
-        "digest_asset_id": digest_asset.get("id"),
-        "digest_asset_digest": digest_asset.get("digest"),
-        "digest_asset_size": digest_asset.get("size"),
-    }
+def verify_fork_binary(binary: bytes, expected_sha256: str) -> str:
+    if len(binary) > MAX_BINARY_SIZE:
+        raise ValueError("fork binary exceeds size limit")
+    if not binary.startswith(ELF_MAGIC):
+        raise ValueError("fork binary is not an ELF executable")
+    actual_sha256 = hashlib.sha256(binary).hexdigest()
+    if actual_sha256 != expected_sha256.lower():
+        raise ValueError(
+            f"fork binary SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}"
+        )
+    return actual_sha256
 
 
-def build_release_payload(release: dict[str, Any], binary_sha256: str) -> dict[str, Any]:
-    tag = release["tag_name"]
-    source_url = release.get("html_url", f"https://github.com/{UPSTREAM_REPOSITORY}/releases/tag/{tag}")
-    provenance = json.dumps(upstream_provenance(release), sort_keys=True, separators=(",", ":"))
+def upstream_provenance(release: dict[str, Any], source: Source = OFFICIAL) -> dict[str, Any]:
+    binary_asset = asset_by_name(release, source.binary_asset)
+    digest_asset = asset_by_name(release, source.digest_asset)
+    if binary_asset is None or digest_asset is None:
+        raise ValueError(f"release {release.get('tag_name')} lacks required source assets")
+    first, second = source.provenance_names
+    provenance: dict[str, Any] = {}
+    for name, asset in ((first, binary_asset), (second, digest_asset)):
+        provenance[f"{name}_asset_id"] = asset.get("id")
+        provenance[f"{name}_asset_digest"] = asset.get("digest")
+        provenance[f"{name}_asset_size"] = asset.get("size")
+    return provenance
+
+
+def release_name(release: dict[str, Any], source: Source = OFFICIAL) -> str:
+    return f"{source.name_prefix}{release.get('name') or release['tag_name']}"
+
+
+def build_release_payload(
+    release: dict[str, Any], binary_sha256: str, source: Source = OFFICIAL
+) -> dict[str, Any]:
+    upstream_tag = release["tag_name"]
+    tag = destination_tag(upstream_tag, source)
+    source_url = release.get(
+        "html_url", f"https://github.com/{source.repository}/releases/tag/{upstream_tag}"
+    )
+    provenance = json.dumps(
+        upstream_provenance(release, source), sort_keys=True, separators=(",", ":")
+    )
     destination = os.environ.get("GITHUB_REPOSITORY", "PentiumB/xray-binary")
     encoded_tag = urllib.parse.quote(tag, safe="")
     config = {"geodata": {
@@ -136,13 +249,23 @@ def build_release_payload(release: dict[str, Any], binary_sha256: str) -> dict[s
         "outbound": "direct",
     }}
     snippet = json.dumps(config, indent=2, ensure_ascii=False)
-    return {
-        "tag_name": tag,
-        "name": release.get("name") or tag,
-        "body": (
+    if source is OFFICIAL:
+        intro = (
             "Автоматически извлечённый без изменений файл `xray` из официального "
             f"архива `{ASSET_NAME}`.\n\n"
-            f"SHA-256 бинарника: `{binary_sha256}`\n\nИсточник: {source_url}\n\n"
+        )
+    else:
+        intro = (
+            f"Неофициальная сборка форка [{source.repository}](https://github.com/{source.repository}): "
+            f"файл `{source.binary_asset}` без изменений, переименован в `{BINARY_NAME}`. "
+            f"SHA-256 сверен с `{source.digest_asset}` и digest GitHub API.\n\n"
+        )
+    payload: dict[str, Any] = {
+        "tag_name": tag,
+        "name": release_name(release, source),
+        "body": (
+            intro
+            + f"SHA-256 бинарника: `{binary_sha256}`\n\nИсточник: {source_url}\n\n"
             "### Конфигурация Remnawave Node\n\n"
             "Добавьте поле `geodata` в конфигурацию:\n\n"
             f"```json\n{snippet}\n```\n\n"
@@ -151,12 +274,16 @@ def build_release_payload(release: dict[str, Any], binary_sha256: str) -> dict[s
         "draft": False,
         "prerelease": bool(release.get("prerelease", False)),
     }
+    if not source.make_latest:
+        payload["make_latest"] = "false"
+    return payload
 
 
-def release_needs_sync(upstream: dict[str, Any], destination: dict[str, Any]) -> bool:
+def release_needs_sync(
+    upstream: dict[str, Any], destination: dict[str, Any], source: Source = OFFICIAL
+) -> bool:
     version_from_tag(upstream["tag_name"])
-    expected_name = upstream.get("name") or upstream["tag_name"]
-    if destination.get("name") != expected_name:
+    if destination.get("name") != release_name(upstream, source):
         return True
     if bool(destination.get("draft")):
         return True
@@ -176,11 +303,11 @@ def release_needs_sync(upstream: dict[str, Any], destination: dict[str, Any]) ->
         recorded_provenance = json.loads(provenance_match.group(1))
     except json.JSONDecodeError:
         return True
-    if recorded_provenance != upstream_provenance(upstream):
+    if recorded_provenance != upstream_provenance(upstream, source):
         return True
 
     binary_sha256 = binary_match.group(1).lower()
-    if body != build_release_payload(upstream, binary_sha256)["body"]:
+    if body != build_release_payload(upstream, binary_sha256, source)["body"]:
         return True
     expected_digest = f"sha256:{binary_sha256}"
     return (assets[0].get("digest") or "").lower() != expected_digest
@@ -290,25 +417,29 @@ def upload_url(release: dict[str, Any], filename: str) -> str:
 
 
 def prepare_binary(
-    client: GitHubClient, upstream: dict[str, Any]
+    client: GitHubClient, upstream: dict[str, Any], source: Source = OFFICIAL
 ) -> tuple[str, bytes, str]:
     tag = upstream["tag_name"]
     version = version_from_tag(tag)
-    zip_asset = asset_by_name(upstream, ASSET_NAME)
-    digest_asset = asset_by_name(upstream, DIGEST_NAME)
-    if zip_asset is None or digest_asset is None:
-        raise ValueError(f"release {tag} lacks required official assets")
+    binary_asset = asset_by_name(upstream, source.binary_asset)
+    digest_asset = asset_by_name(upstream, source.digest_asset)
+    if binary_asset is None or digest_asset is None:
+        raise ValueError(f"release {tag} lacks required source assets")
 
-    digest_bytes = download_asset(client, digest_asset, MAX_DIGEST_SIZE)
-    digest_text = digest_bytes.decode("utf-8")
-    expected_archive_sha256 = parse_sha256(digest_text)
-    archive = download_asset(client, zip_asset, MAX_ARCHIVE_SIZE)
-    with tempfile.TemporaryDirectory() as directory:
-        binary_path = extract_xray(
-            archive, expected_archive_sha256, version, Path(directory)
-        )
-        binary = binary_path.read_bytes()
-    return BINARY_NAME, binary, hashlib.sha256(binary).hexdigest()
+    digest_text = download_asset(client, digest_asset, MAX_DIGEST_SIZE).decode("utf-8")
+    if source is OFFICIAL:
+        expected_archive_sha256 = parse_sha256(digest_text)
+        archive = download_asset(client, binary_asset, MAX_ARCHIVE_SIZE)
+        with tempfile.TemporaryDirectory() as directory:
+            binary_path = extract_xray(
+                archive, expected_archive_sha256, version, Path(directory)
+            )
+            binary = binary_path.read_bytes()
+        return BINARY_NAME, binary, hashlib.sha256(binary).hexdigest()
+
+    expected_sha256 = parse_sha256sums(digest_text, source.binary_asset)
+    binary = download_asset(client, binary_asset, MAX_BINARY_SIZE)
+    return BINARY_NAME, binary, verify_fork_binary(binary, expected_sha256)
 
 
 def ensure_release(
@@ -316,14 +447,14 @@ def ensure_release(
     destination: str,
     upstream: dict[str, Any],
     existing: dict[str, Any] | None,
+    source: Source = OFFICIAL,
 ) -> None:
-    tag = upstream["tag_name"]
-
-    # Verify and prepare the official binary before creating or modifying a
-    # public destination release. A failed download or digest check leaves the
+    # Verify and prepare the binary before creating or modifying a public
+    # destination release. A failed download or digest check leaves the
     # destination untouched.
-    filename, binary, binary_sha256 = prepare_binary(client, upstream)
-    payload = build_release_payload(upstream, binary_sha256)
+    filename, binary, binary_sha256 = prepare_binary(client, upstream, source)
+    payload = build_release_payload(upstream, binary_sha256, source)
+    tag = payload["tag_name"]
 
     staging_payload = dict(payload)
     staging_payload["draft"] = True
@@ -371,7 +502,7 @@ def ensure_release(
         raise RuntimeError(f"published release {tag} does not contain exactly asset {filename}")
     if (published_assets[0].get("digest") or "").lower() != f"sha256:{binary_sha256}":
         raise RuntimeError(f"published release {tag} asset digest does not match upload")
-    print(f"Published and verified official binary {filename} in {tag}")
+    print(f"Published and verified {source.key} binary {filename} in {tag}")
 
 
 def draft_withdrawn_release(
@@ -387,6 +518,53 @@ def draft_withdrawn_release(
     print(f"Moved withdrawn or incomplete upstream release {release['tag_name']} to draft")
 
 
+def source_start(state: dict[str, Any], source: Source) -> str | None:
+    """The mirror boundary of a source, or None when the source is not enabled."""
+    if source is OFFICIAL:
+        return state["start_published_at"]
+    section = state.get(source.key)
+    return section.get("start_published_at") if section else None
+
+
+def sync_source(
+    client: GitHubClient,
+    destination: str,
+    source: Source,
+    start_published_at: str,
+    by_tag: dict[str, dict[str, Any]],
+) -> bool:
+    """Mirror one source. Returns whether anything was changed."""
+    upstream_releases = client.paginate_releases_since(
+        f"{API_ROOT}/repos/{source.repository}/releases", start_published_at
+    )
+    upstream_by_tag = {
+        destination_tag(release["tag_name"], source): release
+        for release in in_scope(upstream_releases, start_published_at, source)
+    }
+    own = {tag: release for tag, release in by_tag.items() if owns_tag(source, tag)}
+
+    planned = plan_releases(upstream_releases, set(own), start_published_at, source)
+    planned_tags = {destination_tag(release["tag_name"], source) for release in planned}
+    repairs = [
+        upstream
+        for tag, upstream in upstream_by_tag.items()
+        if tag in own
+        and tag not in planned_tags
+        and release_needs_sync(upstream, own[tag], source)
+    ]
+    ordered = planned + sorted(repairs, key=lambda release: release["published_at"])
+
+    for upstream in ordered:
+        tag = destination_tag(upstream["tag_name"], source)
+        ensure_release(client, destination, upstream, own.get(tag), source)
+
+    withdrawn = [release for tag, release in own.items() if tag not in upstream_by_tag]
+    for release in withdrawn:
+        draft_withdrawn_release(client, destination, release)
+
+    return bool(ordered or withdrawn)
+
+
 def main() -> int:
     destination = os.environ.get("GITHUB_REPOSITORY", "PentiumB/xray-binary")
     token = os.environ.get("GITHUB_TOKEN")
@@ -397,72 +575,48 @@ def main() -> int:
 
     state_path = Path(__file__).resolve().parents[1] / "mirror-state.json"
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    start_published_at = state["start_published_at"]
+    sources = [
+        (source, start)
+        for source in SOURCES
+        if (start := source_start(state, source)) is not None
+    ]
 
     client = GitHubClient(token)
-    upstream_releases = client.paginate_releases_since(
-        f"{API_ROOT}/repos/{UPSTREAM_REPOSITORY}/releases", start_published_at
-    )
-
-    in_scope_upstream = sorted(
-        (
-            release
-            for release in upstream_releases
-            if is_mirrorable(release)
-            and (release.get("published_at") or "") >= start_published_at
-        ),
-        key=lambda release: release["published_at"],
-        reverse=True,
-    )
 
     if dry_run:
-        if not in_scope_upstream:
-            raise RuntimeError("no mirrorable upstream releases found in configured range")
-        latest = in_scope_upstream[0]
-        zip_asset = asset_by_name(latest, ASSET_NAME)
-        digest_asset = asset_by_name(latest, DIGEST_NAME)
-        assert zip_asset is not None and digest_asset is not None
-        print(
-            json.dumps(
-                {
-                    "tag": latest["tag_name"],
-                    "prerelease": bool(latest["prerelease"]),
-                    "binary_name": BINARY_NAME,
-                    "zip_asset": zip_asset["name"],
-                    "digest_asset": digest_asset["name"],
-                },
-                ensure_ascii=False,
+        for source, start in sources:
+            releases = client.paginate_releases_since(
+                f"{API_ROOT}/repos/{source.repository}/releases", start
             )
-        )
+            candidates = in_scope(releases, start, source)
+            if not candidates:
+                raise RuntimeError(
+                    f"no mirrorable {source.key} releases found in configured range"
+                )
+            latest = candidates[0]
+            print(
+                json.dumps(
+                    {
+                        "source": source.key,
+                        "tag": destination_tag(latest["tag_name"], source),
+                        "prerelease": bool(latest["prerelease"]),
+                        "binary_name": BINARY_NAME,
+                        "binary_asset": source.binary_asset,
+                        "digest_asset": source.digest_asset,
+                    },
+                    ensure_ascii=False,
+                )
+            )
         return 0
 
     destination_releases = client.paginate(f"{API_ROOT}/repos/{destination}/releases")
     by_tag = {release["tag_name"]: release for release in destination_releases}
 
-    planned = plan_releases(upstream_releases, set(by_tag), start_published_at)
-    planned_tags = {release["tag_name"] for release in planned}
-    upstream_by_tag = {release["tag_name"]: release for release in in_scope_upstream}
-    repairs = [
-        upstream
-        for tag, upstream in upstream_by_tag.items()
-        if tag in by_tag
-        and tag not in planned_tags
-        and release_needs_sync(upstream, by_tag[tag])
-    ]
-    ordered = planned + sorted(
-        repairs, key=lambda release: release["published_at"]
-    )
+    changed = False
+    for source, start in sources:
+        changed = sync_source(client, destination, source, start, by_tag) or changed
 
-    for upstream in ordered:
-        ensure_release(client, destination, upstream, by_tag.get(upstream["tag_name"]))
-
-    withdrawn = [
-        release for tag, release in by_tag.items() if tag not in upstream_by_tag
-    ]
-    for release in withdrawn:
-        draft_withdrawn_release(client, destination, release)
-
-    if not ordered and not withdrawn:
+    if not changed:
         print("All mirrored releases already match upstream metadata and verified assets")
     return 0
 
